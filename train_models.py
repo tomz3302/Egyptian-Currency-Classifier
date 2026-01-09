@@ -6,6 +6,7 @@ using proper train/validation/test splits.
 
 import pandas as pd
 import numpy as np
+import re
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
@@ -23,6 +24,7 @@ import shutil
 from PIL import Image
 from xgboost import XGBClassifier
 import cv2
+
 # ========== CONFIGURATION ==========
 # File paths for extracted features
 TRAIN_FEATURES_FILE = "banknote_features_train.csv"
@@ -84,7 +86,7 @@ def load_and_prepare_data():
 
 
     # ========== PREPARE FEATURES AND LABELS ==========
-    print("\n2. Preparing features and labels...")
+    print("\n3. Preparing features and labels...")
     
     # Identify non-feature columns to exclude
     non_feature_cols = ['label', 'filename']
@@ -99,8 +101,26 @@ def load_and_prepare_data():
     X_test = test_df.drop([col for col in non_feature_cols if col in test_df.columns], axis=1)
     y_test = test_df['label']
     
+    # Normalize labels so that a banknote's front face is labled as the back
+    print("\n4. Normalizing labels...")
+    def normalize_label(label):
+        label = str(label).lower().strip()
+
+        # Remove side indicators only
+        label = re.sub(r'\bfront\b', '', label)
+        label = re.sub(r'\bback\b', '', label)
+
+        # Clean extra spaces
+        label = re.sub(r'\s+', ' ', label).strip()
+
+        return label
+
+    y_train = y_train.apply(normalize_label)
+    y_valid = y_valid.apply(normalize_label)
+    y_test  = y_test.apply(normalize_label)
+
         # ========== HANDLE MISSING VALUES ==========
-    print("\n3. Handling missing values...")
+    print("\n5. Handling missing values...")
     
     # Create imputer (use median for robustness)
     imputer = SimpleImputer(strategy='median')
@@ -113,7 +133,7 @@ def load_and_prepare_data():
     print(f"✅ Missing values imputed using median strategy")
 
     # Encode string labels to numerical values
-    print("\n4. Encoding labels...")
+    print("\n6. Encoding labels...")
     label_encoder = LabelEncoder()
     
     # Fit encoder on training labels, then transform all sets
@@ -125,7 +145,7 @@ def load_and_prepare_data():
     print(f"✅ Number of features: {X_train.shape[1]}")
     
     # ========== SCALE FEATURES ==========
-    print("\n5. Scaling features...")
+    print("\n7. Scaling features...")
     scaler = StandardScaler()
     
     # Fit scaler on training data only
@@ -473,10 +493,10 @@ def save_misclassified_images(results, best_model_name, X_test, y_test, test_df,
                         
                     except Exception as e:
                         print(f"  ✗ Error copying {filename}: {e}")
-                else:
-                    print(f"  ✗ Could not find image: {filename}")
+                # else:
+                #     print(f"  ✗ Could not find image: {filename}")
     
-    print(f"\n✅ Saved {misclassified_count} misclassified images to '{misclassified_dir}'")
+    # print(f"\n✅ Saved {misclassified_count} misclassified images to '{misclassified_dir}'")
     create_misclassified_summary(misclassified_dir, y_test_decoded, y_test_pred_decoded, test_df)
     
     return misclassified_count
