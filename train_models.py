@@ -21,7 +21,8 @@ from sklearn.impute import SimpleImputer
 import os
 import shutil
 from PIL import Image
-
+from xgboost import XGBClassifier
+import cv2
 # ========== CONFIGURATION ==========
 # File paths for extracted features
 TRAIN_FEATURES_FILE = "banknote_features_train.csv"
@@ -163,6 +164,18 @@ def train_and_evaluate_models(X_train, y_train, X_valid, y_valid, X_test, y_test
         'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
         'Support Vector Machine': SVC(kernel='rbf', random_state=42),
         'K-Nearest Neighbors': KNeighborsClassifier(n_neighbors=5),
+        'XGBoost': XGBClassifier(
+            n_estimators=2000,
+            max_depth=5,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            tree_method='hist',
+            random_state=42,
+            reg_alpha=0.5,
+            reg_lambda=5,
+            early_stopping_rounds=20
+        )
         # 'Naive Bayes': GaussianNB(),
         # 'Logistic Regression': LogisticRegression(max_iter=1000, random_state=42)
     }
@@ -181,7 +194,11 @@ def train_and_evaluate_models(X_train, y_train, X_valid, y_valid, X_test, y_test
         print(f"\n📊 Training {name}...")
         
         # Train the model
-        model.fit(X_train, y_train)
+        if name == 'XGBoost':
+            model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_valid, y_valid)])
+            verbose=50
+        else:
+            model.fit(X_train, y_train,)
         results['models'][name] = model
         
         # Make predictions on all datasets
@@ -371,32 +388,27 @@ def save_misclassified_images(results, best_model_name, X_test, y_test, test_df,
     print("SAVING MISCLASSIFIED IMAGES")
     print("=" * 70)
     
-    # Get the best model
+    # Get the best model and predictions
     best_model = results['models'][best_model_name]
-    
-    # Get predictions
     y_test_pred = best_model.predict(X_test)
-    
-    # Create directory for misclassified images
-    misclassified_dir = "misclassified_images"
-    os.makedirs(misclassified_dir, exist_ok=True)
-    
-    print(f"Saving misclassified images to: {misclassified_dir}")
     
     # Decode labels
     y_test_decoded = label_encoder.inverse_transform(y_test)
     y_test_pred_decoded = label_encoder.inverse_transform(y_test_pred)
     
-    # Get filenames from test_df
-    # Ensure indices match
-    if len(test_df) != len(y_test):
-        print("Warning: Mismatch between test_df length and y_test length")
-        # Try to match by resetting indices
-        test_df = test_df.reset_index(drop=True)
+    # Directories
+    misclassified_dir = "misclassified_images"
+    cropped_dir = "cropped_banknotes"  # Folder created by extract_features.py
+    os.makedirs(misclassified_dir, exist_ok=True)
+    
+    print(f"Saving misclassified images to: {misclassified_dir}")
     
     misclassified_count = 0
     
-    # Process each test sample
+    # Ensure indices match
+    if len(test_df) != len(y_test):
+        test_df = test_df.reset_index(drop=True)
+    
     for i in range(len(y_test)):
         true_label = y_test_decoded[i]
         pred_label = y_test_pred_decoded[i]
@@ -404,64 +416,67 @@ def save_misclassified_images(results, best_model_name, X_test, y_test, test_df,
         if true_label != pred_label:
             misclassified_count += 1
             
-            # Get filename from test_df
             if i < len(test_df):
                 filename = test_df.iloc[i]['filename']
-                original_label = test_df.iloc[i]['label']
+                original_label = str(test_df.iloc[i]['label']) # Ensure string for path joining
                 
-                # Create descriptive filename
-                base_name = os.path.splitext(filename)[0]
+                # Setup basic file info
+                base_name_no_ext = os.path.splitext(filename)[0]
                 ext = os.path.splitext(filename)[1]
                 new_filename = f"{i:04d}_True_{true_label}_Pred_{pred_label}_{filename}"
                 
-                # Try to find the original image
-                image_found = False
-                
-                # Search in test directory structure
-                test_image_path = os.path.join(base_images_dir, "test", original_label, filename)
-                train_image_path = os.path.join(base_images_dir, "train", original_label, filename)
-                valid_image_path = os.path.join(base_images_dir, "valid", original_label, filename)
-                
-                # Check multiple possible locations
-                possible_paths = [
-                    test_image_path,
-                    train_image_path,
-                    valid_image_path,
-                    # Also check without the split subdirectory (direct in class folder)
-                    os.path.join(base_images_dir, original_label, filename),
-                    # Check in the current directory if images were copied
-                    filename
-                ]
+                # 1. CHECK FOR CROPPED VERSION FIRST
+                # extract_features.py saves as: {class}_{name}_cropped.jpg
+                cropped_fname = f"{original_label}_{base_name_no_ext}_cropped.jpg"
+                cropped_path_check = os.path.join(cropped_dir, cropped_fname)
                 
                 source_path = None
-                for path in possible_paths:
-                    if os.path.exists(path):
-                        source_path = path
-                        break
+                is_cropped_source = False
                 
+                if os.path.exists(cropped_path_check):
+                    source_path = cropped_path_check
+                    is_cropped_source = True
+                    # If using cropped source, ensure output extension matches (jpg)
+                    new_filename = os.path.splitext(new_filename)[0] + ".jpg"
+                    ext = ".jpg" 
+                
+                # 2. FALLBACK TO ORIGINAL SEARCH
+                if not source_path:
+                    # Search in dataset directory structure
+                    possible_paths = [
+                        os.path.join(base_images_dir, "test", original_label, filename),
+                        os.path.join(base_images_dir, "train", original_label, filename),
+                        os.path.join(base_images_dir, "valid", original_label, filename),
+                        os.path.join(base_images_dir, original_label, filename),
+                        filename # Current dir
+                    ]
+                    
+                    for path in possible_paths:
+                        if os.path.exists(path):
+                            source_path = path
+                            break
+                
+                # 3. COPY AND ANNOTATE
                 if source_path and os.path.exists(source_path):
                     try:
-                        # Copy the image
                         dest_path = os.path.join(misclassified_dir, new_filename)
+                        
+                        # Copy image
                         shutil.copy2(source_path, dest_path)
                         
-                        # Also create a version with annotation on the image
-                        save_annotated_image(source_path, dest_path.replace(ext, f"_annotated{ext}"), 
-                                           true_label, pred_label)
+                        # Annotate
+                        annotated_path = dest_path.replace(ext, f"_annotated{ext}")
+                        save_annotated_image(source_path, annotated_path, true_label, pred_label)
                         
-                        print(f"  ✓ {filename}: {true_label} → {pred_label}")
+                        origin_type = "Cropped" if is_cropped_source else "Original"
+                        # print(f"  ✓ {filename} ({origin_type}): {true_label} → {pred_label}")
                         
                     except Exception as e:
                         print(f"  ✗ Error copying {filename}: {e}")
                 else:
                     print(f"  ✗ Could not find image: {filename}")
-                    print(f"    Searched in: {possible_paths[:3]}...")
-            else:
-                print(f"  ✗ No filename found for index {i}")
     
     print(f"\n✅ Saved {misclassified_count} misclassified images to '{misclassified_dir}'")
-    
-    # Create a summary CSV file
     create_misclassified_summary(misclassified_dir, y_test_decoded, y_test_pred_decoded, test_df)
     
     return misclassified_count
