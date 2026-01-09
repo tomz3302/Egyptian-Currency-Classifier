@@ -14,7 +14,7 @@ from scipy.stats import skew, kurtosis
 
 # ========== CONFIGURATION ==========
 # Set your base directory path here
-BASE_DIR = "C:/Users/user/Desktop/ML Project/dataset_cleaned_split"
+BASE_DIR = "C:/Users/user/Desktop/ML Project/dataset_cleaned_frontback_split"
 TRAIN_DIR = os.path.join(BASE_DIR, "train")
 VALID_DIR = os.path.join(BASE_DIR, "valid")
 TEST_DIR = os.path.join(BASE_DIR, "test")
@@ -123,74 +123,182 @@ def extract_simple_features(image_path):
     except Exception as e:
         print(f"Error processing {image_path}: {e}")
         return None
-
-def extract_hsv_features(image_path):
-    """
-    Extract HSV color histogram features from an image.
     
-    Args:
-        image_path: Path to the image file
-        
-    Returns:
-        Dictionary of extracted HSV features or None if error occurs
-    """
-    try:
-        # Load image
-        with Image.open(image_path) as img:
-            img_rgb = img.convert('RGB')
-            img_array = np.array(img_rgb)
-        
-        # ========== AUTO-CROP BANKNOTE REGION ==========
+def crop_banknote(img_array, image_path):
+    # ========== AUTO-CROP BANKNOTE REGION ==========
         h, w = img_array.shape[:2]
         
-        # Convert to grayscale for analysis
+        # Convert to different color spaces for better detection
         gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
         
-        # Find brightest regions (likely background)
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+        # ========== METHOD 1: EDGE-BASED DETECTION ==========
+        # Banknotes have lots of edges (text, patterns, etc.)
+        edges = cv2.Canny(gray, 30, 100)
         
-        # Find contours
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # Dilate to connect edges
+        kernel = np.ones((3, 3), np.uint8)
+        edges_dilated = cv2.dilate(edges, kernel, iterations=2)
+        edges_dilated = cv2.morphologyEx(edges_dilated, cv2.MORPH_CLOSE, kernel)
         
-        # Look for banknote-sized contours
+        # ========== METHOD 2: COLOR UNIFORMITY ==========
+        # Banknotes have more uniform colors than complex backgrounds
+        # Calculate color variance in small patches
+        h_channel = hsv[:, :, 0]
+        s_channel = hsv[:, :, 1]
+        v_channel = hsv[:, :, 2]
+        
+        # Banknotes usually have moderate-high saturation
+        saturation_mask = s_channel > 50
+        
+        # ========== METHOD 3: TEXTURE-BASED ==========
+        # Banknotes have fine textures (patterns, text)
+        # Use Laplacian to detect texture
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        texture_mask = np.abs(laplacian) > 10
+        
+        # ========== COMBINE ALL MASKS ==========
+        # Combine edge and texture information
+        combined_mask = edges_dilated.astype(bool) | texture_mask
+        
+        # Also include areas with moderate saturation (banknotes are colorful)
+        combined_mask = combined_mask | saturation_mask
+        
+        # Convert to uint8 for OpenCV operations
+        combined_mask_uint8 = combined_mask.astype(np.uint8) * 255
+        
+        # Clean up the mask
+        combined_mask_uint8 = cv2.morphologyEx(combined_mask_uint8, cv2.MORPH_OPEN, kernel)
+        combined_mask_uint8 = cv2.morphologyEx(combined_mask_uint8, cv2.MORPH_CLOSE, kernel)
+        
+        # ========== FIND BANKNOTE CONTOUR ==========
+        contours, _ = cv2.findContours(combined_mask_uint8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
         banknote_contour = None
-        max_area = 0
+        best_score = -1
         
         for contour in contours:
             area = cv2.contourArea(contour)
-            x, y, cw, ch = cv2.boundingRect(contour)
-            aspect = cw / ch if ch > 0 else 0
+            # x, y, cw, ch = cv2.boundingRect(contour)
             
-            # Banknote criteria:
-            # 1. Reasonable size (not too small, not entire image)
-            # 2. Aspect ratio ~1.5-2.5 (banknote shape)
-            # 3. Not too close to edges (background usually at edges)
-            if (area > w*h*0.05 and area < w*h*0.8 and 
-                1.2 < aspect < 3.0 and
-                x > w*0.05 and y > h*0.05 and
-                x + cw < w*0.95 and y + ch < h*0.95):
-                
-                if area > max_area:
-                    max_area = area
-                    banknote_contour = contour
+            area = cv2.contourArea(contour)
+            
+            # ========== AREA PERCENTAGE CHECK ==========
+            size_ratio = area / (w * h)
+            # Only process contours that are between 10% and 90% of total image
+            if size_ratio < 0.20 or size_ratio > 0.90:
+                continue
+
+            # Skip very small contours
+            if area < 1000:  # Minimum area
+                continue
+            
+            rect = cv2.minAreaRect(contour)
+            (x, y), (cw, ch), angle = rect
+
+            if cw == 0 or ch == 0:
+                continue
+
+            aspect = max(cw, ch) / min(cw, ch)
+            
+            # 1. Aspect ratio score (banknotes are rectangular)
+            aspect_score = 0
+            if 1.6 <= aspect <= 2.4:
+                aspect_score = 1 - abs(aspect - 2.0) / 2.0  # Closer to 2.0 is better
+            
+            # 2. Size score (not too small, not too large)
+            size_ratio = area / (w * h)
+            if 0.1 <= size_ratio <= 0.8:  # Between 10% and 80% of image
+                size_score = 1 - abs(size_ratio - 0.3) / 0.3  # Prefer ~30% size
+            else:
+                size_score = 0
+            
+            # 3. Edge density score (banknotes have many edges)
+            # Extract the region
+            x_i = int(x)
+            y_i = int(y)
+            cw_i = int(cw)
+            ch_i = int(ch)
+
+            region = gray[
+                max(0, y_i - 5):min(h, y_i + ch_i + 5),
+                max(0, x_i - 5):min(w, x_i + cw_i + 5)
+            ]
+            
+            if region.size > 0:
+                region_edges = cv2.Canny(region, 30, 100)
+                edge_density = np.sum(region_edges > 0) / region_edges.size
+                edge_score = min(edge_density * 10, 1.0)  # Normalize
+            else:
+                edge_score = 0
+            
+            # 4. Color uniformity score (banknotes have uniform colors)
+            if region.size > 0 and len(region.shape) == 2:
+                color_std = np.std(region)
+                color_score = 1 - min(color_std / 50, 1.0)  # Lower std = more uniform
+            else:
+                color_score = 0
+            
+            # Combined score (weighted)
+            combined_score = (aspect_score * 0.25 + 
+                            size_score * 0.25 + 
+                            edge_score * 0.30 + 
+                            color_score * 0.20)
+            
+            if combined_score > best_score and combined_score > 0.3:
+                best_score = combined_score
+                banknote_contour = contour
         
         cropped_img_array = img_array
         was_cropped = False
 
         # If found, crop to banknote
         if banknote_contour is not None:
-            x, y, cw, ch = cv2.boundingRect(banknote_contour)
-            # Add 10% padding
-            pad_x = int(cw * 0.1)
-            pad_y = int(ch * 0.1)
-            x1 = max(0, x - pad_x)
-            y1 = max(0, y - pad_y)
-            x2 = min(w, x + cw + pad_x)
-            y2 = min(h, y + ch + pad_y)
+            # Get the rotated rectangle (minAreaRect)
+            rect = cv2.minAreaRect(banknote_contour)
+            box = cv2.boxPoints(rect)
+            box = np.array(box, dtype="float32")
+
+            # 1. ORDER THE CORNERS (Top-Left, Top-Right, Bottom-Right, Bottom-Left)
+            # This ensures the image isn't warped into a "knot"
+            s = box.sum(axis=1)
+            diff = np.diff(box, axis=1)
             
+            ordered_src = np.zeros((4, 2), dtype="float32")
+            ordered_src[0] = box[np.argmin(s)]       # Top-left
+            ordered_src[2] = box[np.argmax(s)]       # Bottom-right
+            ordered_src[1] = box[np.argmin(diff)]    # Top-right
+            ordered_src[3] = box[np.argmax(diff)]    # Bottom-left
+
+            # 2. CALCULATE TARGET DIMENSIONS
+            # We find the width and height of the new "straight" image
+            width_a = np.sqrt(((ordered_src[2][0] - ordered_src[3][0]) ** 2) + ((ordered_src[2][1] - ordered_src[3][1]) ** 2))
+            width_b = np.sqrt(((ordered_src[1][0] - ordered_src[0][0]) ** 2) + ((ordered_src[1][1] - ordered_src[0][1]) ** 2))
+            max_width = max(int(width_a), int(width_b))
+
+            height_a = np.sqrt(((ordered_src[1][0] - ordered_src[2][0]) ** 2) + ((ordered_src[1][1] - ordered_src[2][1]) ** 2))
+            height_b = np.sqrt(((ordered_src[0][0] - ordered_src[3][0]) ** 2) + ((ordered_src[0][1] - ordered_src[3][1]) ** 2))
+            max_height = max(int(height_a), int(height_b))
+
+            # 3. DEFINE DESTINATION POINTS
+            dst_pts = np.array([
+                [0, 0],
+                [max_width - 1, 0],
+                [max_width - 1, max_height - 1],
+                [0, max_height - 1]], dtype="float32")
+
+            # 4. PERFORM THE WARP
+            M = cv2.getPerspectiveTransform(ordered_src, dst_pts)
+            warped = cv2.warpPerspective(img_array, M, (max_width, max_height))
+
+            # 5. AUTO-ORIENT (If it's vertical, rotate it to horizontal)
+            if warped.shape[0] > warped.shape[1]:
+                warped = cv2.rotate(warped, cv2.ROTATE_90_CLOCKWISE)
+
+            cropped_img_array = warped
             was_cropped = True
-            cropped_img_array = img_array[y1:y2, x1:x2]
-            print(f"  ✓ Cropped: {image_path}: {w}x{h} → {cropped_img_array.shape[1]}x{cropped_img_array.shape[0]}")
+            crop_percentage = ( (max_width * max_height) / (w * h) ) * 100
+            print(f"  ✓ Cropped: {image_path}: {w}x{h} → {cropped_img_array.shape[1]}x{cropped_img_array.shape[0]} ({crop_percentage:.1f}% of original)")
 
         # ========== SAVE CROPPED IMAGE TO FOLDER ==========
         if was_cropped:
@@ -216,6 +324,31 @@ def extract_hsv_features(image_path):
             # Also save comparison image (original vs cropped)
             save_comparison_image(img_array, cropped_img_array, image_path, class_name)
 
+        return cropped_img_array
+
+def extract_hsv_features(image_path):
+    """
+    Extract HSV color histogram features from an image.
+    
+    Args:
+        image_path: Path to the image file
+        
+    Returns:
+        Dictionary of extracted HSV features or None if error occurs
+    """
+    try:
+        # Load image
+        with Image.open(image_path) as img:
+            img_rgb = img.convert('RGB')
+            img_array = np.array(img_rgb)
+        
+        # ========== BANKNOTE CROPPING ==========
+        img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
+
+        cropped_bgr = crop_banknote(img_bgr, image_path)
+
+        # Convert back to RGB for feature extraction
+        cropped_img_array = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
 
         # Convert from RGB to HSV
         img_hsv = cv2.cvtColor(cropped_img_array, cv2.COLOR_RGB2HSV)
@@ -228,6 +361,10 @@ def extract_hsv_features(image_path):
 
         features = {}
         
+        cropped_img_array = cv2.resize(cropped_img_array, (512, 256))
+        img_hsv = cv2.resize(img_hsv, (512, 256))
+
+
         # ========== 1. HISTOGRAM FEATURES ==========
         # Calculate histograms for H, S, and V channels
         # Hue has a range of 0-180 in OpenCV
@@ -314,6 +451,9 @@ def save_comparison_image(original, cropped, image_path, class_name):
         comparison_dir = "crop_comparisons"
         os.makedirs(comparison_dir, exist_ok=True)
         
+        original = cv2.cvtColor(original, cv2.COLOR_BGR2RGB)
+        cropped = cv2.cvtColor(cropped, cv2.COLOR_BGR2RGB)
+
         # Create comparison image
         original_h, original_w = original.shape[:2]
         cropped_h, cropped_w = cropped.shape[:2]
