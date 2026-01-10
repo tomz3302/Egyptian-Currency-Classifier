@@ -26,6 +26,7 @@ from xgboost import XGBClassifier
 import cv2
 
 # ========== CONFIGURATION ==========
+BASE_DIR = "C:/Users/user/Desktop/ML Project/dataset_cleaned_frontback_split"
 # File paths for extracted features
 TRAIN_FEATURES_FILE = "banknote_features_train.csv"
 VALID_FEATURES_FILE = "banknote_features_valid.csv"
@@ -37,6 +38,10 @@ SCALER_FILE = "feature_scaler.pkl"
 LABEL_ENCODER_FILE = "label_encoder.pkl"
 RESULTS_PLOT_FILE = "model_performance.png"
 CONFUSION_MATRIX_FILE = "confusion_matrix.png"
+
+# Confidence visualization
+CONFIDENCE_IMAGES_DIR = "confidence_visualization"
+CONFIDENCE_SUMMARY_FILE = "confidence_summary.csv"
 # ====================================
 
 def load_and_prepare_data():
@@ -180,10 +185,10 @@ def train_and_evaluate_models(X_train, y_train, X_valid, y_valid, X_test, y_test
     
     # Define models to train (traditional ML as per project requirements)
     models = {
-        'Decision Tree': DecisionTreeClassifier(max_depth=10, random_state=42),
+        # 'Decision Tree': DecisionTreeClassifier(max_depth=10, random_state=42),
         'Random Forest': RandomForestClassifier(n_estimators=100, random_state=42),
-        'Support Vector Machine': SVC(kernel='rbf', random_state=42),
-        'K-Nearest Neighbors': KNeighborsClassifier(n_neighbors=5),
+        # 'Support Vector Machine': SVC(kernel='rbf', random_state=42, probability=True),
+        # 'K-Nearest Neighbors': KNeighborsClassifier(n_neighbors=5),
         'XGBoost': XGBClassifier(
             n_estimators=2000,
             max_depth=5,
@@ -206,7 +211,8 @@ def train_and_evaluate_models(X_train, y_train, X_valid, y_valid, X_test, y_test
         'train_acc': {},
         'valid_acc': {},
         'test_acc': {},
-        'feature_importances': {}
+        'feature_importances': {},
+        'test_probabilities': {}  # Added to store confidence scores
     }
     
     # Train and evaluate each model
@@ -215,8 +221,8 @@ def train_and_evaluate_models(X_train, y_train, X_valid, y_valid, X_test, y_test
         
         # Train the model
         if name == 'XGBoost':
-            model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_valid, y_valid)])
-            verbose=50
+            model.fit(X_train, y_train, eval_set=[(X_train, y_train), (X_valid, y_valid)], verbose=False)
+            print(f"✅ XGBoost Training Complete. Best iteration: {model.get_booster().best_iteration}")
         else:
             model.fit(X_train, y_train,)
         results['models'][name] = model
@@ -235,6 +241,18 @@ def train_and_evaluate_models(X_train, y_train, X_valid, y_valid, X_test, y_test
         results['valid_acc'][name] = valid_acc
         results['test_acc'][name] = test_acc
         
+        # Store confidence scores (probabilities) for test set
+        try:
+            # Try to get probability predictions
+            if hasattr(model, 'predict_proba'):
+                y_test_proba = model.predict_proba(X_test)
+                results['test_probabilities'][name] = y_test_proba
+                print(f"   Confidence scores available ✓")
+            else:
+                print(f"   ⚠️ No probability predictions available for confidence scores")
+        except Exception as e:
+            print(f"   ⚠️ Could not get confidence scores: {e}")
+        
         # Print results
         print(f"   Training Accuracy:   {train_acc:.4f}")
         print(f"   Validation Accuracy: {valid_acc:.4f}")
@@ -250,6 +268,328 @@ def train_and_evaluate_models(X_train, y_train, X_valid, y_valid, X_test, y_test
             results['feature_importances'][name] = model.feature_importances_
     
     return results
+
+
+def save_confidence_images(model, model_name, X_test, y_test, test_df, label_encoder, 
+                          base_images_dir=BASE_DIR):
+    """
+    Save all test images with confidence scores annotated on them.
+    
+    Args:
+        model: Trained model
+        model_name: Name of the model
+        X_test: Test features
+        y_test: True test labels (encoded)
+        test_df: Original test dataframe with filenames
+        label_encoder: Fitted label encoder
+        base_images_dir: Base directory where original images are stored
+    """
+    print(f"\n📊 Generating confidence visualizations for {model_name}...")
+    
+    # Create output directory
+    model_dir = os.path.join(CONFIDENCE_IMAGES_DIR, model_name.replace(" ", "_"))
+    os.makedirs(model_dir, exist_ok=True)
+    
+    # Get predictions and confidence scores
+    try:
+        y_test_pred = model.predict(X_test)
+        
+        # Try to get probability predictions
+        if hasattr(model, 'predict_proba'):
+            y_test_proba = model.predict_proba(X_test)
+            confidence_scores = np.max(y_test_proba, axis=1)
+            all_probabilities = y_test_proba
+        else:
+            # For models without probability, use decision function if available
+            if hasattr(model, 'decision_function'):
+                decision_scores = model.decision_function(X_test)
+                # Normalize decision scores to [0, 1] using softmax
+                exp_scores = np.exp(decision_scores - np.max(decision_scores, axis=1, keepdims=True))
+                all_probabilities = exp_scores / exp_scores.sum(axis=1, keepdims=True)
+                confidence_scores = np.max(all_probabilities, axis=1)
+            else:
+                # Fallback: use 1.0 for correct predictions, 0.0 for incorrect
+                confidence_scores = np.where(y_test_pred == y_test, 1.0, 0.0)
+                all_probabilities = None
+        
+        # Decode labels
+        y_test_decoded = label_encoder.inverse_transform(y_test)
+        y_test_pred_decoded = label_encoder.inverse_transform(y_test_pred)
+        
+        # Store results for summary
+        results_data = []
+        
+        # Process each test image
+        for i in range(len(y_test)):
+            if i < len(test_df):
+                filename = test_df.iloc[i]['filename']
+                original_label = str(test_df.iloc[i]['label'])
+                
+                # Get confidence score
+                confidence = confidence_scores[i] if i < len(confidence_scores) else 0.0
+                
+                # Get top 3 predictions if probabilities are available
+                top_predictions = []
+                if all_probabilities is not None and i < len(all_probabilities):
+                    probs = all_probabilities[i]
+                    top_indices = np.argsort(probs)[-3:][::-1]
+                    for idx in top_indices:
+                        top_predictions.append({
+                            'class': label_encoder.inverse_transform([idx])[0],
+                            'probability': probs[idx]
+                        })
+                
+                # Store for summary
+                results_data.append({
+                    'filename': filename,
+                    'true_label': y_test_decoded[i],
+                    'predicted_label': y_test_pred_decoded[i],
+                    'confidence_score': confidence,
+                    'is_correct': y_test_pred[i] == y_test[i],
+                    'top_prediction_1': top_predictions[0]['class'] if top_predictions else '',
+                    'top_probability_1': top_predictions[0]['probability'] if top_predictions else 0.0,
+                    'top_prediction_2': top_predictions[1]['class'] if len(top_predictions) > 1 else '',
+                    'top_probability_2': top_predictions[1]['probability'] if len(top_predictions) > 1 else 0.0,
+                    'top_prediction_3': top_predictions[2]['class'] if len(top_predictions) > 2 else '',
+                    'top_probability_3': top_predictions[2]['probability'] if len(top_predictions) > 2 else 0.0,
+                })
+                
+                # Create annotated image
+                annotated_filename = f"{i:04d}_True_{y_test_decoded[i]}_Pred_{y_test_pred_decoded[i]}_Conf_{confidence:.3f}.jpg"
+                save_annotated_image_with_confidence(
+                    filename, original_label, model_dir, annotated_filename,
+                    y_test_decoded[i], y_test_pred_decoded[i], confidence,
+                    top_predictions, base_images_dir
+                )
+        
+        # Save summary CSV
+        summary_df = pd.DataFrame(results_data)
+        summary_path = os.path.join(model_dir, "confidence_summary.csv")
+        summary_df.to_csv(summary_path, index=False)
+        
+        # Calculate confidence statistics
+        correct_confidences = summary_df[summary_df['is_correct']]['confidence_score']
+        incorrect_confidences = summary_df[~summary_df['is_correct']]['confidence_score']
+        
+        print(f"✅ Confidence visualizations saved to: {model_dir}")
+        print(f"   - Total images: {len(summary_df)}")
+        print(f"   - Correct predictions: {len(correct_confidences)}")
+        print(f"   - Incorrect predictions: {len(incorrect_confidences)}")
+        if len(correct_confidences) > 0:
+            print(f"   - Avg confidence (correct): {correct_confidences.mean():.3f}")
+        if len(incorrect_confidences) > 0:
+            print(f"   - Avg confidence (incorrect): {incorrect_confidences.mean():.3f}")
+        
+        # Create confidence distribution plot
+        create_confidence_distribution_plot(summary_df, model_name, model_dir)
+        
+    except Exception as e:
+        print(f"⚠️  Error generating confidence visualizations: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def save_annotated_image_with_confidence(filename, original_label, output_dir, output_filename,
+                                        true_label, pred_label, confidence, top_predictions,
+                                        base_images_dir):
+    """
+    Save an image annotated with true label, predicted label, confidence score, and top predictions.
+    
+    Args:
+        filename: Original image filename
+        original_label: Label from the dataframe (for finding the image)
+        output_dir: Directory to save annotated image
+        output_filename: Name for the output file
+        true_label: True label
+        pred_label: Predicted label
+        confidence: Confidence score (0-1)
+        top_predictions: List of top predictions with probabilities
+        base_images_dir: Base directory for original images
+    """
+    try:
+        # Try to find the image
+        source_path = None
+        
+        # 1. Check for cropped version
+        cropped_dir = "cropped_banknotes"
+        base_name_no_ext = os.path.splitext(filename)[0]
+        cropped_fname = f"{original_label}_{base_name_no_ext}_cropped.jpg"
+        cropped_path_check = os.path.join(cropped_dir, cropped_fname)
+        
+        if os.path.exists(cropped_path_check):
+            source_path = cropped_path_check
+        
+        # 2. Search in dataset directories
+        if not source_path:
+            possible_paths = [
+                os.path.join(base_images_dir, "test", original_label, filename),
+                os.path.join(base_images_dir, "train", original_label, filename),
+                os.path.join(base_images_dir, "valid", original_label, filename),
+                os.path.join(base_images_dir, original_label, filename),
+                filename  # Current directory
+            ]
+            
+            for path in possible_paths:
+                if os.path.exists(path):
+                    source_path = path
+                    break
+        
+        if not source_path or not os.path.exists(source_path):
+            # print(f"  ⚠️  Image not found: {filename}")
+            return
+        
+        # Load image
+        img = cv2.imread(source_path)
+        if img is None:
+            return
+        
+        # Convert from BGR to RGB
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Resize for consistent display
+        max_height = 600
+        if img.shape[0] > max_height:
+            scale = max_height / img.shape[0]
+            new_width = int(img.shape[1] * scale)
+            img = cv2.resize(img, (new_width, max_height))
+        
+        # Add border for text
+        border_top = 180  # More space for confidence info
+        border_bottom = 20
+        img_with_border = cv2.copyMakeBorder(img, border_top, border_bottom, 0, 0,
+                                            cv2.BORDER_CONSTANT, value=(245, 245, 245))
+        
+        # Add text annotations
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        
+        # Title
+        cv2.putText(img_with_border, "BANKNOTE CLASSIFICATION CONFIDENCE", (20, 40),
+                   font, 0.8, (0, 0, 0), 2)
+        
+        # True vs Predicted
+        cv2.putText(img_with_border, f"True: {true_label}", (20, 80),
+                   font, 0.7, (0, 100, 0), 2)
+        cv2.putText(img_with_border, f"Predicted: {pred_label}", (20, 110),
+                   font, 0.7, (0, 0, 200), 2)
+        
+        # Confidence score with color coding
+        confidence_percent = confidence * 100
+        if confidence >= 0.9:
+            color = (0, 200, 0)  # Green for high confidence
+        elif confidence >= 0.7:
+            color = (200, 200, 0)  # Yellow for medium confidence
+        else:
+            color = (0, 0, 200)  # Red for low confidence
+        
+        cv2.putText(img_with_border, f"Confidence: {confidence_percent:.1f}%", (20, 140),
+                   font, 0.7, color, 2)
+        
+        # Add confidence bar visualization
+        bar_width = 200
+        bar_height = 15
+        bar_x = 20
+        bar_y = 160
+        
+        # Background bar
+        cv2.rectangle(img_with_border, (bar_x, bar_y), 
+                     (bar_x + bar_width, bar_y + bar_height), (200, 200, 200), -1)
+        
+        # Confidence fill
+        fill_width = int(bar_width * confidence)
+        cv2.rectangle(img_with_border, (bar_x, bar_y), 
+                     (bar_x + fill_width, bar_y + bar_height), color, -1)
+        
+        # Bar border
+        cv2.rectangle(img_with_border, (bar_x, bar_y), 
+                     (bar_x + bar_width, bar_y + bar_height), (100, 100, 100), 1)
+        
+        # Top predictions (if available)
+        if top_predictions:
+            cv2.putText(img_with_border, "Top Predictions:", (250, 80),
+                       font, 0.6, (0, 0, 0), 1)
+            
+            y_offset = 100
+            for j, pred in enumerate(top_predictions[:3]):  # Show top 3
+                pred_text = f"{j+1}. {pred['class']}: {pred['probability']*100:.1f}%"
+                cv2.putText(img_with_border, pred_text, (250, y_offset),
+                           font, 0.5, (50, 50, 50), 1)
+                y_offset += 20
+        
+        # Correct/Wrong indicator
+        is_correct = true_label == pred_label
+        status_color = (0, 200, 0) if is_correct else (0, 0, 200)
+        status_text = "✓ CORRECT" if is_correct else "✗ WRONG"
+        
+        cv2.putText(img_with_border, status_text, (img_with_border.shape[1] - 150, 80),
+                   font, 0.7, status_color, 2)
+        
+        # Filename at bottom
+        cv2.putText(img_with_border, f"File: {filename}", 
+                   (10, img_with_border.shape[0] - 5),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1)
+        
+        # Save the annotated image
+        output_path = os.path.join(output_dir, output_filename)
+        cv2.imwrite(output_path, img_with_border)
+        
+    except Exception as e:
+        print(f"Error creating confidence image for {filename}: {e}")
+
+
+def create_confidence_distribution_plot(summary_df, model_name, output_dir):
+    """
+    Create a plot showing confidence distribution for correct vs incorrect predictions.
+    
+    Args:
+        summary_df: DataFrame with confidence scores
+        model_name: Name of the model
+        output_dir: Directory to save the plot
+    """
+    try:
+        plt.figure(figsize=(10, 6))
+        
+        # Separate correct and incorrect predictions
+        correct_confidences = summary_df[summary_df['is_correct']]['confidence_score']
+        incorrect_confidences = summary_df[~summary_df['is_correct']]['confidence_score']
+        
+        # Create histogram
+        bins = np.linspace(0, 1, 21)
+        
+        if len(correct_confidences) > 0:
+            plt.hist(correct_confidences, bins=bins, alpha=0.7, label='Correct Predictions',
+                    color='green', edgecolor='black')
+        
+        if len(incorrect_confidences) > 0:
+            plt.hist(incorrect_confidences, bins=bins, alpha=0.7, label='Incorrect Predictions',
+                    color='red', edgecolor='black')
+        
+        plt.title(f'Confidence Distribution - {model_name}', fontsize=14)
+        plt.xlabel('Confidence Score', fontsize=12)
+        plt.ylabel('Number of Images', fontsize=12)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # Add statistics text
+        stats_text = f"Total: {len(summary_df)} images\n"
+        stats_text += f"Correct: {len(correct_confidences)} ({len(correct_confidences)/len(summary_df)*100:.1f}%)\n"
+        stats_text += f"Incorrect: {len(incorrect_confidences)} ({len(incorrect_confidences)/len(summary_df)*100:.1f}%)"
+        
+        if len(correct_confidences) > 0:
+            stats_text += f"\nAvg confidence (correct): {correct_confidences.mean():.3f}"
+        
+        if len(incorrect_confidences) > 0:
+            stats_text += f"\nAvg confidence (incorrect): {incorrect_confidences.mean():.3f}"
+        
+        plt.figtext(0.75, 0.75, stats_text, fontsize=10, 
+                   bbox=dict(boxstyle="round,pad=0.5", facecolor="wheat", alpha=0.8))
+        
+        plt.tight_layout()
+        plot_path = os.path.join(output_dir, "confidence_distribution.png")
+        plt.savefig(plot_path, dpi=100)
+        plt.close()
+        
+    except Exception as e:
+        print(f"Error creating confidence distribution plot: {e}")
 
 
 def analyze_results(results, label_encoder, X_test, y_test, feature_names):
@@ -391,7 +731,7 @@ def analyze_results(results, label_encoder, X_test, y_test, feature_names):
     return best_model_name, best_model
 
 def save_misclassified_images(results, best_model_name, X_test, y_test, test_df, 
-                              label_encoder, base_images_dir="C:/Users/user/Desktop/ML Project/dataset_cleaned_split"):
+                              label_encoder, base_images_dir=BASE_DIR):
     """
     Save misclassified images to a folder with their predicted labels.
     
@@ -650,6 +990,9 @@ def main():
     print("EGYPTIAN BANKNOTE CLASSIFICATION - MODEL TRAINING")
     print("=" * 70)
     
+    # Create confidence visualization directory
+    os.makedirs(CONFIDENCE_IMAGES_DIR, exist_ok=True)
+    
     # Step 1: Load and prepare data
     data = load_and_prepare_data()
     if data is None:
@@ -665,8 +1008,31 @@ def main():
     best_model_name, best_model = analyze_results(results, label_encoder, 
                                                   X_test, y_test, feature_names)
     
-    # Step 4: Save misclassified images
-    # Need to reload test data to get filenames
+    # Step 4: Generate confidence visualizations for ALL models
+    print("\n" + "=" * 70)
+    print("GENERATING CONFIDENCE VISUALIZATIONS")
+    print("=" * 70)
+    
+    try:
+        # Reload test data to get filenames
+        test_df_original = pd.read_csv(TEST_FEATURES_FILE)
+        
+        # Generate confidence visualizations for each model
+        for model_name, model in results['models'].items():
+            save_confidence_images(
+                model, model_name, X_test, y_test,
+                test_df_original, label_encoder,
+                BASE_DIR
+            )
+        
+        print(f"\n✅ All confidence visualizations saved to '{CONFIDENCE_IMAGES_DIR}'")
+        
+    except Exception as e:
+        print(f"⚠️  Could not generate confidence visualizations: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Step 5: Save misclassified images
     print("\n" + "=" * 70)
     print("PREPARING MISCLASSIFIED IMAGES ANALYSIS")
     print("=" * 70)
@@ -676,10 +1042,9 @@ def main():
         test_df_original = pd.read_csv(TEST_FEATURES_FILE)
         
         # Save misclassified images
-        base_images_dir = "C:/Users/user/Desktop/ML Project/dataset_cleaned_split"
         misclassified_count = save_misclassified_images(
             results, best_model_name, X_test, y_test, 
-            test_df_original, label_encoder, base_images_dir
+            test_df_original, label_encoder, BASE_DIR
         )
         
         # Calculate misclassification rate
@@ -691,7 +1056,7 @@ def main():
         print(f"⚠️  Could not save misclassified images: {e}")
         print("This feature requires the original test CSV and image files.")
     
-    # Step 5: Save models
+    # Step 6: Save models
     save_models(best_model, scaler, label_encoder)
     
     # Final summary
@@ -714,6 +1079,7 @@ def main():
     print(f"  • {RESULTS_PLOT_FILE} - Model performance comparison")
     print(f"  • {CONFUSION_MATRIX_FILE} - Confusion matrix")
     print(f"  • feature_importance.png - Feature importance (if available)")
+    print(f"  • {CONFIDENCE_IMAGES_DIR}/ - Folder with confidence visualizations")
     print(f"  • misclassified_images/ - Folder with misclassified images")
     print(f"  • misclassified_images/misclassified_summary.csv - Summary of errors")
     

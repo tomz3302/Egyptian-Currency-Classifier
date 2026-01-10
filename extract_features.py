@@ -99,13 +99,137 @@ def crop_banknote(img_array, image_path):
             cropped_path = os.path.join(cropped_dir, cropped_filename)
             
             # Save cropped image
-            cropped_img_pil = Image.fromarray(cropped_img_array)
+            cropped_img_array_save = cv2.cvtColor(cropped_img_array, cv2.COLOR_BGR2RGB)
+            cropped_img_pil = Image.fromarray(cropped_img_array_save)
             cropped_img_pil.save(cropped_path)
             
             # Also save comparison image (original vs cropped)
             save_comparison_image(img_array, cropped_img_array, image_path, class_name)
 
         return cropped_img_array
+
+def augment_image(image_array, image_path):
+    """
+    Create multiple augmented versions of an image.
+    Only applies augmentation to training data.
+    
+    Args:
+        image_array: The image as a numpy array
+        image_path: Path to the original image file
+        
+    Returns:
+        List of augmented images (including the original)
+    """
+    # Create list starting with original image
+    augmented_images = [image_array]
+    
+    # Add augmented versions (only for training data)
+    if "train" in image_path.lower():
+        # 1. Horizontal Flip (common for banknotes)
+        flipped_horizontal = cv2.flip(image_array, 1)
+        augmented_images.append(flipped_horizontal)
+        
+        # 2. Vertical Flip
+        flipped_vertical = cv2.flip(image_array, 0)
+        augmented_images.append(flipped_vertical)
+        
+        # 3. Small Rotation (±10 degrees)
+        angle = np.random.uniform(-10, 10)
+        height, width = image_array.shape[:2]
+        rotation_matrix = cv2.getRotationMatrix2D((width/2, height/2), angle, 1)
+        rotated = cv2.warpAffine(image_array, rotation_matrix, (width, height))
+        augmented_images.append(rotated)
+        
+        # 4. Brightness Adjustment (±30%)
+        brightness_factor = np.random.uniform(0.7, 1.3)
+        brightened = np.clip(image_array * brightness_factor, 0, 255).astype(np.uint8)
+        augmented_images.append(brightened)
+        
+        # 5. Contrast Adjustment
+        contrast_factor = np.random.uniform(0.7, 1.3)
+        mean = np.mean(image_array)
+        contrasted = np.clip((image_array - mean) * contrast_factor + mean, 0, 255).astype(np.uint8)
+        augmented_images.append(contrasted)
+        
+        # 6. Add Gaussian Blur (slight)
+        if image_array.shape[0] > 50 and image_array.shape[1] > 50:
+            kernel_size = np.random.choice([3, 5])
+            blurred = cv2.GaussianBlur(image_array, (kernel_size, kernel_size), 0)
+            augmented_images.append(blurred)
+        
+        # 7. Add Salt & Pepper Noise
+        if np.random.random() > 0.5:  # 50% chance
+            noisy = image_array.copy()
+            amount = np.random.uniform(0.001, 0.005)  # 0.1% to 0.5% noise
+            # Salt
+            num_salt = np.ceil(amount * image_array.size * 0.5)
+            coords = [np.random.randint(0, i - 1, int(num_salt)) for i in image_array.shape]
+            noisy[coords[0], coords[1], :] = 255
+            # Pepper
+            num_pepper = np.ceil(amount * image_array.size * 0.5)
+            coords = [np.random.randint(0, i - 1, int(num_pepper)) for i in image_array.shape]
+            noisy[coords[0], coords[1], :] = 0
+            augmented_images.append(noisy)
+        
+        # 8. Random Cropping (95% of original)
+        if image_array.shape[0] > 100 and image_array.shape[1] > 100:
+            crop_ratio = np.random.uniform(0.9, 0.95)
+            crop_h = int(image_array.shape[0] * crop_ratio)
+            crop_w = int(image_array.shape[1] * crop_ratio)
+            start_y = np.random.randint(0, image_array.shape[0] - crop_h)
+            start_x = np.random.randint(0, image_array.shape[1] - crop_w)
+            cropped_version = image_array[start_y:start_y+crop_h, start_x:start_x+crop_w]
+            augmented_images.append(cropped_version)
+        
+        # 9. Color Jitter (random channel shifts)
+        if np.random.random() > 0.5:
+            jittered = image_array.copy()
+            # Randomly adjust each channel
+            for channel in range(3):
+                shift = np.random.uniform(-20, 20)
+                jittered[:, :, channel] = np.clip(jittered[:, :, channel] + shift, 0, 255).astype(np.uint8)
+            augmented_images.append(jittered)
+        
+        # 10. Random Scaling (zoom in/out)
+        if image_array.shape[0] > 100 and image_array.shape[1] > 100:
+            scale = np.random.uniform(0.9, 1.1)
+            new_h = int(image_array.shape[0] * scale)
+            new_w = int(image_array.shape[1] * scale)
+            scaled = cv2.resize(image_array, (new_w, new_h))
+            # Crop or pad to original size
+            if scale < 1:
+                # Pad if scaled down
+                pad_h = image_array.shape[0] - new_h
+                pad_w = image_array.shape[1] - new_w
+                scaled = cv2.copyMakeBorder(scaled, 
+                                            pad_h//2, pad_h - pad_h//2,
+                                            pad_w//2, pad_w - pad_w//2,
+                                            cv2.BORDER_REFLECT)
+            else:
+                # Crop if scaled up
+                start_y = (new_h - image_array.shape[0]) // 2
+                start_x = (new_w - image_array.shape[1]) // 2
+                scaled = scaled[start_y:start_y+image_array.shape[0],
+                                start_x:start_x+image_array.shape[1]]
+            augmented_images.append(scaled)
+        
+        # 11. Perspective Transformation (simulate different angles)
+        if np.random.random() > 0.7:  # 30% chance
+            height, width = image_array.shape[:2]
+            # Random perspective points
+            pts1 = np.float32([[0,0], [width,0], [0,height], [width,height]])
+            max_offset = min(width, height) * 0.1
+            pts2 = np.float32([
+                [np.random.uniform(-max_offset, max_offset), np.random.uniform(-max_offset, max_offset)],
+                [width + np.random.uniform(-max_offset, max_offset), np.random.uniform(-max_offset, max_offset)],
+                [np.random.uniform(-max_offset, max_offset), height + np.random.uniform(-max_offset, max_offset)],
+                [width + np.random.uniform(-max_offset, max_offset), height + np.random.uniform(-max_offset, max_offset)]
+            ])
+            matrix = cv2.getPerspectiveTransform(pts1, pts2)
+            perspective = cv2.warpPerspective(image_array, matrix, (width, height))
+            augmented_images.append(perspective)
+    
+    return augmented_images
 
 def extract_features(image_path):
     """
@@ -125,100 +249,101 @@ def extract_features(image_path):
         
         # ========== BANKNOTE CROPPING ==========
         img_bgr = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-
         cropped_bgr = crop_banknote(img_bgr, image_path)
-
+        
         # Convert back to RGB for feature extraction
         cropped_img_array = cv2.cvtColor(cropped_bgr, cv2.COLOR_BGR2RGB)
-
-        # Convert from RGB to HSV
-        img_hsv = cv2.cvtColor(cropped_img_array, cv2.COLOR_RGB2HSV)
         
-        if len(cropped_img_array.shape) == 3:
-            height, width, channels = cropped_img_array.shape
-        else:
-            height, width = cropped_img_array.shape
-            channels = 1
-
-        features = {}
+        # ========== DATA AUGMENTATION ==========
+        augmented_images = augment_image(cropped_img_array, image_path)
         
-        cropped_img_array = cv2.resize(cropped_img_array, (512, 256))
-        img_hsv = cv2.resize(img_hsv, (512, 256))
-
-
-        # ========== 1. HISTOGRAM FEATURES ==========
-        # Calculate histograms for H, S, and V channels
-        # Hue has a range of 0-180 in OpenCV
-        h_hist = cv2.calcHist([img_hsv], [0], None, [32], [0, 180])
-        s_hist = cv2.calcHist([img_hsv], [1], None, [32], [0, 256])
-        v_hist = cv2.calcHist([img_hsv], [2], None, [32], [0, 256])
+        # Extract features from each augmented image
+        all_features = []
         
-        # Normalize histograms
-        h_hist = h_hist / np.sum(h_hist) if np.sum(h_hist) > 0 else h_hist
-        s_hist = s_hist / np.sum(s_hist) if np.sum(s_hist) > 0 else s_hist
-        v_hist = v_hist / np.sum(v_hist) if np.sum(v_hist) > 0 else v_hist
-        
-        # Flatten histograms and add to features dictionary
-        for i in range(32):
-            features[f'h_hist_bin_{i}'] = float(h_hist[i][0])
-            features[f's_hist_bin_{i}'] = float(s_hist[i][0])
-            features[f'v_hist_bin_{i}'] = float(v_hist[i][0])
-        
-        # ========== 2. CHANNEL STATISTICS ==========
-        # Calculate statistical measures for each channel
-        h_channel = img_hsv[:, :, 0].flatten()
-        s_channel = img_hsv[:, :, 1].flatten()
-        v_channel = img_hsv[:, :, 2].flatten()
-        
-        features['hue_mean'] = np.mean(h_channel)
-        features['hue_std'] = np.std(h_channel)
-        features['hue_median'] = np.median(h_channel)
-        
-        features['saturation_mean'] = np.mean(s_channel)
-        features['saturation_std'] = np.std(s_channel)
-        features['saturation_median'] = np.median(s_channel)
-        
-        features['value_mean'] = np.mean(v_channel)
-        features['value_std'] = np.std(v_channel)
-        features['value_median'] = np.median(v_channel)
-        
-        # ========== 3. COLOR DOMINANCE RATIOS ==========
-        features['hs_ratio'] = features['hue_mean'] / (features['saturation_mean'] + 1e-6)
-        features['hv_ratio'] = features['hue_mean'] / (features['value_mean'] + 1e-6)
-        features['sv_ratio'] = features['saturation_mean'] / (features['value_mean'] + 1e-6)
-        
-        # ========== 4. HISTOGRAM STATISTICS ==========
-        # Dominant color bin indices
-        features['hue_dominant_bin'] = np.argmax(h_hist)
-        features['saturation_dominant_bin'] = np.argmax(s_hist)
-        features['value_dominant_bin'] = np.argmax(v_hist)
-        
-        # ========== 5. COLOR STATISTICS (if color image) ==========
-        if channels == 3:
-            # Extract red, green, blue channels
-            red = cropped_img_array[:, :, 0].flatten()
-            green = cropped_img_array[:, :, 1].flatten()
-            blue = cropped_img_array[:, :, 2].flatten()
+        for aug_img in augmented_images:
+            # Resize for consistency (after augmentation)
+            aug_img = cv2.resize(aug_img, (512, 256))
             
+            # Convert from RGB to HSV
+            img_hsv = cv2.cvtColor(aug_img, cv2.COLOR_RGB2HSV)
+            
+            features = {}
+            
+            # ========== 1. HISTOGRAM FEATURES ==========
+            # Calculate histograms for H, S, and V channels
+            # Hue has a range of 0-180 in OpenCV
+            h_hist = cv2.calcHist([img_hsv], [0], None, [32], [0, 180])
+            s_hist = cv2.calcHist([img_hsv], [1], None, [32], [0, 256])
+            v_hist = cv2.calcHist([img_hsv], [2], None, [32], [0, 256])
+            
+            # Normalize histograms
+            h_hist = h_hist / np.sum(h_hist) if np.sum(h_hist) > 0 else h_hist
+            s_hist = s_hist / np.sum(s_hist) if np.sum(s_hist) > 0 else s_hist
+            v_hist = v_hist / np.sum(v_hist) if np.sum(v_hist) > 0 else v_hist
+            
+            # Flatten histograms and add to features dictionary
+            for i in range(32):
+                features[f'h_hist_bin_{i}'] = float(h_hist[i][0])
+                features[f's_hist_bin_{i}'] = float(s_hist[i][0])
+                features[f'v_hist_bin_{i}'] = float(v_hist[i][0])
+            
+            # ========== 2. CHANNEL STATISTICS ==========
             # Calculate statistical measures for each channel
-            features['red_mean'] = np.mean(red)
-            features['red_std'] = np.std(red)
-            features['red_median'] = np.median(red)
+            h_channel = img_hsv[:, :, 0].flatten()
+            s_channel = img_hsv[:, :, 1].flatten()
+            v_channel = img_hsv[:, :, 2].flatten()
             
-            features['green_mean'] = np.mean(green)
-            features['green_std'] = np.std(green)
-            features['green_median'] = np.median(green)
+            features['hue_mean'] = np.mean(h_channel)
+            features['hue_std'] = np.std(h_channel)
+            features['hue_median'] = np.median(h_channel)
             
-            features['blue_mean'] = np.mean(blue)
-            features['blue_std'] = np.std(blue)
-            features['blue_median'] = np.median(blue)
+            features['saturation_mean'] = np.mean(s_channel)
+            features['saturation_std'] = np.std(s_channel)
+            features['saturation_median'] = np.median(s_channel)
             
-            # Calculate color ratios (useful for distinguishing banknote colors)
-            features['rg_ratio'] = features['red_mean'] / (features['green_mean'] + 1e-6)
-            features['rb_ratio'] = features['red_mean'] / (features['blue_mean'] + 1e-6)
-            features['gb_ratio'] = features['green_mean'] / (features['blue_mean'] + 1e-6)
-
-        return features
+            features['value_mean'] = np.mean(v_channel)
+            features['value_std'] = np.std(v_channel)
+            features['value_median'] = np.median(v_channel)
+            
+            # ========== 3. COLOR DOMINANCE RATIOS ==========
+            features['hs_ratio'] = features['hue_mean'] / (features['saturation_mean'] + 1e-6)
+            features['hv_ratio'] = features['hue_mean'] / (features['value_mean'] + 1e-6)
+            features['sv_ratio'] = features['saturation_mean'] / (features['value_mean'] + 1e-6)
+            
+            # ========== 4. HISTOGRAM STATISTICS ==========
+            # Dominant color bin indices
+            features['hue_dominant_bin'] = np.argmax(h_hist)
+            features['saturation_dominant_bin'] = np.argmax(s_hist)
+            features['value_dominant_bin'] = np.argmax(v_hist)
+            
+            # ========== 5. COLOR STATISTICS (if color image) ==========
+            if aug_img.shape[2] == 3:
+                # Extract red, green, blue channels
+                red = aug_img[:, :, 0].flatten()
+                green = aug_img[:, :, 1].flatten()
+                blue = aug_img[:, :, 2].flatten()
+                
+                # Calculate statistical measures for each channel
+                features['red_mean'] = np.mean(red)
+                features['red_std'] = np.std(red)
+                features['red_median'] = np.median(red)
+                
+                features['green_mean'] = np.mean(green)
+                features['green_std'] = np.std(green)
+                features['green_median'] = np.median(green)
+                
+                features['blue_mean'] = np.mean(blue)
+                features['blue_std'] = np.std(blue)
+                features['blue_median'] = np.median(blue)
+                
+                # Calculate color ratios (useful for distinguishing banknote colors)
+                features['rg_ratio'] = features['red_mean'] / (features['green_mean'] + 1e-6)
+                features['rb_ratio'] = features['red_mean'] / (features['blue_mean'] + 1e-6)
+                features['gb_ratio'] = features['green_mean'] / (features['blue_mean'] + 1e-6)
+            
+            all_features.append(features)
+        
+        return all_features
         
     except Exception as e:
         print(f"Error processing {image_path}: {e}")
@@ -342,14 +467,28 @@ def process_folder(folder_path, max_images_per_class):
         # Process each image
         processed_count = 0
         for img_path in image_paths:
-            features = extract_features(str(img_path))
-            if features:
-                features['label'] = class_name
-                features['filename'] = img_path.name
-                all_features.append(features)
-                processed_count += 1
+            features_list = extract_features(str(img_path))
+            if features_list:
+                # Handle both single features (dictionary) and multiple features (list)
+                if isinstance(features_list, list):
+                    # Multiple augmented versions
+                    for i, features in enumerate(features_list):
+                        features['label'] = class_name
+                        # Add augmentation identifier to filename
+                        if i > 0:
+                            features['filename'] = f"{img_path.name}_aug{i-1}"
+                        else:
+                            features['filename'] = img_path.name
+                        all_features.append(features)
+                        processed_count += 1
+                else:
+                    # Single features (dictionary)
+                    features_list['label'] = class_name
+                    features_list['filename'] = img_path.name
+                    all_features.append(features_list)
+                    processed_count += 1
         
-        print(f"    Extracted features from {processed_count} images")
+        print(f"    Extracted features from {processed_count} samples")
     
     return all_features
 
